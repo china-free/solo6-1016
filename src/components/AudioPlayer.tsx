@@ -64,13 +64,7 @@ export const AudioPlayer = () => {
       ...engineParamsRef.current,
       noiseType: type,
     };
-    if (audioState.isPlaying) {
-      stop();
-      setTimeout(() => {
-        updateParams(engineParamsRef.current);
-        start();
-      }, 50);
-    }
+    updateParams({ noiseType: type });
   };
 
   const currentNoiseType = engineParamsRef.current.noiseType;

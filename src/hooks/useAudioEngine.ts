@@ -17,21 +17,29 @@ interface UseAudioEngineReturn {
   getAnalyser: () => AnalyserNode | null;
 }
 
+const FREQUENCY_REBUILD_THRESHOLD = 200;
+const BANDWIDTH_REBUILD_THRESHOLD = 300;
+const CROSSFADE_DURATION = 0.05;
+
 export const useAudioEngine = (
   initialParams: UseAudioEngineOptions
 ): UseAudioEngineReturn => {
   const audioContextRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
-  const filterNodesRef = useRef<BiquadFilterNode[]>([]);
-  const gainNodeRef = useRef<GainNode | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const noiseBufferRef = useRef<AudioBuffer | null>(null);
-  const isPlayingRef = useRef(false);
+
+  const activeGraphRef = useRef<{
+    source: AudioBufferSourceNode;
+    filters: BiquadFilterNode[];
+    gain: GainNode;
+    analyser: AnalyserNode;
+  } | null>(null);
+
   const paramsRef = useRef(initialParams);
+  const isPlayingRef = useRef(false);
 
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      audioContextRef.current = new (window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
     }
     return audioContextRef.current;
   }, []);
@@ -44,10 +52,9 @@ export const useAudioEngine = (
       const channel1 = buffer.getChannelData(1);
 
       let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
-      let c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0;
 
       for (let i = 0; i < bufferSize; i++) {
-        let white = Math.random() * 2 - 1;
+        const white = Math.random() * 2 - 1;
 
         if (type === 'white' || type === 'narrowband') {
           channel0[i] = white;
@@ -65,14 +72,11 @@ export const useAudioEngine = (
           channel0[i] = pink;
           channel1[i] = pink;
         } else if (type === 'brown' || type === 'notched') {
-          white = (Math.random() * 2 - 1) * 3.5;
+          const scaledWhite = white * 3.5;
           const lastOut0 = channel0[i - 1] || 0;
           const lastOut1 = channel1[i - 1] || 0;
-          channel0[i] = (lastOut0 + 0.02 * white) / 1.02;
-          channel1[i] = (lastOut1 + 0.02 * white) / 1.02;
-          channel0[i] *= 3.5;
-          channel1[i] *= 3.5;
-          void c0; void c1; void c2; void c3; void c4; void c5; void c6;
+          channel0[i] = ((lastOut0 + 0.02 * scaledWhite) / 1.02) * 3.5;
+          channel1[i] = ((lastOut1 + 0.02 * scaledWhite) / 1.02) * 3.5;
         }
       }
 
@@ -81,81 +85,215 @@ export const useAudioEngine = (
     []
   );
 
-  const buildAudioGraph = useCallback(() => {
-    const ctx = initAudioContext();
-    const params = paramsRef.current;
+  const buildGraph = useCallback(
+    (ctx: AudioContext, params: UseAudioEngineOptions) => {
+      const noiseType: NoiseType = params.noiseType;
+      const buffer = createNoiseBuffer(ctx, noiseType);
 
-    if (sourceNodeRef.current) {
-      sourceNodeRef.current.stop();
-      sourceNodeRef.current.disconnect();
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.loop = true;
+
+      const filters: BiquadFilterNode[] = [];
+      let currentNode: AudioNode = source;
+
+      const centerFreq = params.centerFrequency;
+      const bw = params.bandwidth;
+
+      if (noiseType === 'narrowband' || noiseType === 'notched') {
+        const bpFilter = ctx.createBiquadFilter();
+        bpFilter.type = 'bandpass';
+        bpFilter.frequency.value = centerFreq;
+        bpFilter.Q.value = bw > 0 ? centerFreq / (bw * 2) : 1;
+        filters.push(bpFilter);
+        currentNode.connect(bpFilter);
+        currentNode = bpFilter;
+      } else if (noiseType === 'pink' || noiseType === 'white' || noiseType === 'brown') {
+        const hpFilter = ctx.createBiquadFilter();
+        hpFilter.type = 'highpass';
+        hpFilter.frequency.value = Math.max(50, centerFreq - bw * 2);
+        hpFilter.Q.value = 0.707;
+        filters.push(hpFilter);
+        currentNode.connect(hpFilter);
+        currentNode = hpFilter;
+
+        const lpFilter = ctx.createBiquadFilter();
+        lpFilter.type = 'lowpass';
+        lpFilter.frequency.value = Math.min(20000, centerFreq + bw * 2);
+        lpFilter.Q.value = 0.707;
+        filters.push(lpFilter);
+        currentNode.connect(lpFilter);
+        currentNode = lpFilter;
+      }
+
+      if (noiseType === 'notched' && params.notchFrequency) {
+        const notchFilter = ctx.createBiquadFilter();
+        notchFilter.type = 'notch';
+        notchFilter.frequency.value = params.notchFrequency;
+        notchFilter.Q.value = 5;
+        filters.push(notchFilter);
+        currentNode.connect(notchFilter);
+        currentNode = notchFilter;
+      }
+
+      const gain = ctx.createGain();
+      const levelMultiplier =
+        Math.pow(10, params.soundLevel / 20) * params.volume * 0.3;
+      gain.gain.value = levelMultiplier;
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+
+      currentNode.connect(gain);
+      gain.connect(analyser);
+      analyser.connect(ctx.destination);
+
+      return { source, filters, gain, analyser };
+    },
+    [createNoiseBuffer]
+  );
+
+  const needsRebuild = useCallback(
+    (
+      oldParams: UseAudioEngineOptions,
+      newParams: Partial<UseAudioEngineOptions>
+    ): boolean => {
+      if (newParams.noiseType !== undefined && newParams.noiseType !== oldParams.noiseType) {
+        return true;
+      }
+      if (
+        newParams.notchFrequency !== undefined &&
+        newParams.notchFrequency !== oldParams.notchFrequency
+      ) {
+        return true;
+      }
+      if (
+        newParams.centerFrequency !== undefined &&
+        Math.abs(newParams.centerFrequency - oldParams.centerFrequency) >
+          FREQUENCY_REBUILD_THRESHOLD
+      ) {
+        return true;
+      }
+      if (
+        newParams.bandwidth !== undefined &&
+        Math.abs(newParams.bandwidth - oldParams.bandwidth) >
+          BANDWIDTH_REBUILD_THRESHOLD
+      ) {
+        return true;
+      }
+      return false;
+    },
+    []
+  );
+
+  const rebuildWithCrossfade = useCallback(() => {
+    const ctx = audioContextRef.current;
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const oldGraph = activeGraphRef.current;
+    const newGraph = buildGraph(ctx, paramsRef.current);
+
+    if (oldGraph) {
+      oldGraph.gain.gain.cancelScheduledValues(now);
+      oldGraph.gain.gain.setValueAtTime(oldGraph.gain.gain.value, now);
+      oldGraph.gain.gain.linearRampToValueAtTime(0, now + CROSSFADE_DURATION);
     }
-    filterNodesRef.current.forEach((f) => f.disconnect());
-    filterNodesRef.current = [];
-    if (gainNodeRef.current) gainNodeRef.current.disconnect();
-    if (analyserRef.current) analyserRef.current.disconnect();
 
-    const noiseType: NoiseType = params.noiseType === 'notched' ? 'notched' : params.noiseType;
-    noiseBufferRef.current = createNoiseBuffer(ctx, noiseType);
+    newGraph.gain.gain.setValueAtTime(0, now);
+    newGraph.gain.gain.linearRampToValueAtTime(
+      newGraph.gain.gain.value,
+      now + CROSSFADE_DURATION
+    );
 
-    const source = ctx.createBufferSource();
-    source.buffer = noiseBufferRef.current;
-    source.loop = true;
-    sourceNodeRef.current = source;
+    newGraph.source.start(now);
+    activeGraphRef.current = newGraph;
 
-    let currentNode: AudioNode = source;
+    if (oldGraph) {
+      const oldSource = oldGraph.source;
+      const oldGain = oldGraph.gain;
+      const oldAnalyser = oldGraph.analyser;
+      const oldFilters = oldGraph.filters;
 
-    const centerFreq = params.centerFrequency;
-    const bw = params.bandwidth;
-
-    if (params.noiseType === 'narrowband' || params.noiseType === 'notched') {
-      const bpFilter = ctx.createBiquadFilter();
-      bpFilter.type = 'bandpass';
-      bpFilter.frequency.value = centerFreq;
-      bpFilter.Q.value = centerFreq / (bw * 2);
-      filterNodesRef.current.push(bpFilter);
-      currentNode.connect(bpFilter);
-      currentNode = bpFilter;
-    } else if (params.noiseType === 'pink' || params.noiseType === 'white' || params.noiseType === 'brown') {
-      const hpFilter = ctx.createBiquadFilter();
-      hpFilter.type = 'highpass';
-      hpFilter.frequency.value = Math.max(50, centerFreq - bw * 2);
-      hpFilter.Q.value = 0.707;
-      filterNodesRef.current.push(hpFilter);
-      currentNode.connect(hpFilter);
-      currentNode = hpFilter;
-
-      const lpFilter = ctx.createBiquadFilter();
-      lpFilter.type = 'lowpass';
-      lpFilter.frequency.value = Math.min(20000, centerFreq + bw * 2);
-      lpFilter.Q.value = 0.707;
-      filterNodesRef.current.push(lpFilter);
-      currentNode.connect(lpFilter);
-      currentNode = lpFilter;
+      setTimeout(() => {
+        try {
+          oldSource.stop();
+        } catch {
+          // ignore
+        }
+        oldSource.disconnect();
+        oldFilters.forEach((f) => f.disconnect());
+        oldGain.disconnect();
+        oldAnalyser.disconnect();
+      }, (CROSSFADE_DURATION + 0.02) * 1000);
     }
+  }, [buildGraph]);
 
-    if (params.noiseType === 'notched' && params.notchFrequency) {
-      const notchFilter = ctx.createBiquadFilter();
-      notchFilter.type = 'notch';
-      notchFilter.frequency.value = params.notchFrequency;
-      notchFilter.Q.value = 5;
-      filterNodesRef.current.push(notchFilter);
-      currentNode.connect(notchFilter);
-      currentNode = notchFilter;
-    }
+  const updateFilterParamsSmoothly = useCallback(
+    (newParams: Partial<UseAudioEngineOptions>) => {
+      const ctx = audioContextRef.current;
+      const graph = activeGraphRef.current;
+      if (!ctx || !graph) return;
 
-    const gainNode = ctx.createGain();
-    const levelMultiplier = Math.pow(10, params.soundLevel / 20) * params.volume * 0.3;
-    gainNode.gain.value = levelMultiplier;
-    gainNodeRef.current = gainNode;
+      const time = ctx.currentTime;
 
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyserRef.current = analyser;
+      if (newParams.soundLevel !== undefined || newParams.volume !== undefined) {
+        const params = paramsRef.current;
+        const levelMultiplier =
+          Math.pow(10, params.soundLevel / 20) * params.volume * 0.3;
+        graph.gain.gain.setTargetAtTime(levelMultiplier, time, CROSSFADE_DURATION);
+      }
 
-    currentNode.connect(gainNode);
-    gainNode.connect(analyser);
-    analyser.connect(ctx.destination);
-  }, [initAudioContext, createNoiseBuffer]);
+      if (
+        newParams.centerFrequency !== undefined ||
+        newParams.bandwidth !== undefined
+      ) {
+        const params = paramsRef.current;
+        graph.filters.forEach((filter) => {
+          if (filter.type === 'bandpass' && params.bandwidth > 0) {
+            filter.frequency.setTargetAtTime(
+              params.centerFrequency,
+              time,
+              CROSSFADE_DURATION
+            );
+            filter.Q.setTargetAtTime(
+              params.centerFrequency / (params.bandwidth * 2),
+              time,
+              CROSSFADE_DURATION
+            );
+          }
+          if (filter.type === 'highpass') {
+            filter.frequency.setTargetAtTime(
+              Math.max(50, params.centerFrequency - params.bandwidth * 2),
+              time,
+              CROSSFADE_DURATION
+            );
+          }
+          if (filter.type === 'lowpass') {
+            filter.frequency.setTargetAtTime(
+              Math.min(20000, params.centerFrequency + params.bandwidth * 2),
+              time,
+              CROSSFADE_DURATION
+            );
+          }
+        });
+      }
+
+      if (newParams.notchFrequency !== undefined) {
+        const params = paramsRef.current;
+        graph.filters.forEach((filter) => {
+          if (filter.type === 'notch' && params.notchFrequency) {
+            filter.frequency.setTargetAtTime(
+              params.notchFrequency,
+              time,
+              CROSSFADE_DURATION
+            );
+          }
+        });
+      }
+    },
+    []
+  );
 
   const start = useCallback(() => {
     const ctx = initAudioContext();
@@ -163,75 +301,95 @@ export const useAudioEngine = (
       ctx.resume();
     }
 
-    buildAudioGraph();
-
-    if (sourceNodeRef.current) {
-      sourceNodeRef.current.start();
-      isPlayingRef.current = true;
+    if (isPlayingRef.current && activeGraphRef.current) {
+      return;
     }
-  }, [initAudioContext, buildAudioGraph]);
+
+    const graph = buildGraph(ctx, paramsRef.current);
+    graph.source.start();
+    activeGraphRef.current = graph;
+    isPlayingRef.current = true;
+  }, [initAudioContext, buildGraph]);
 
   const stop = useCallback(() => {
-    if (sourceNodeRef.current) {
-      sourceNodeRef.current.stop();
-      sourceNodeRef.current.disconnect();
-      sourceNodeRef.current = null;
+    const ctx = audioContextRef.current;
+    const graph = activeGraphRef.current;
+
+    if (graph && ctx) {
+      const now = ctx.currentTime;
+      graph.gain.gain.cancelScheduledValues(now);
+      graph.gain.gain.setValueAtTime(graph.gain.gain.value, now);
+      graph.gain.gain.linearRampToValueAtTime(0, now + CROSSFADE_DURATION);
+
+      const source = graph.source;
+      const gain = graph.gain;
+      const analyser = graph.analyser;
+      const filters = graph.filters;
+
+      setTimeout(() => {
+        try {
+          source.stop();
+        } catch {
+          // ignore
+        }
+        source.disconnect();
+        filters.forEach((f) => f.disconnect());
+        gain.disconnect();
+        analyser.disconnect();
+      }, (CROSSFADE_DURATION + 0.02) * 1000);
     }
+
+    activeGraphRef.current = null;
     isPlayingRef.current = false;
   }, []);
 
   const updateParams = useCallback(
     (newParams: Partial<UseAudioEngineOptions>) => {
-      paramsRef.current = { ...paramsRef.current, ...newParams };
+      const oldParams = { ...paramsRef.current };
+      paramsRef.current = { ...oldParams, ...newParams };
 
-      if (isPlayingRef.current) {
-        if (gainNodeRef.current && audioContextRef.current) {
-          const params = paramsRef.current;
-          const levelMultiplier = Math.pow(10, params.soundLevel / 20) * params.volume * 0.3;
-          gainNodeRef.current.gain.setTargetAtTime(
-            levelMultiplier,
-            audioContextRef.current.currentTime,
-            0.05
-          );
-        }
+      if (!isPlayingRef.current) return;
 
-        if (
-          (newParams.centerFrequency !== undefined ||
-            newParams.bandwidth !== undefined ||
-            newParams.noiseType !== undefined ||
-            newParams.notchFrequency !== undefined) &&
-          audioContextRef.current
-        ) {
-          const time = audioContextRef.current.currentTime;
-          filterNodesRef.current.forEach((filter) => {
-            if (filter.type === 'bandpass' && paramsRef.current.bandwidth > 0) {
-              filter.frequency.setTargetAtTime(paramsRef.current.centerFrequency, time, 0.05);
-              filter.Q.setTargetAtTime(
-                paramsRef.current.centerFrequency / (paramsRef.current.bandwidth * 2),
-                time,
-                0.05
-              );
-            }
-            if (filter.type === 'notch' && paramsRef.current.notchFrequency) {
-              filter.frequency.setTargetAtTime(paramsRef.current.notchFrequency, time, 0.05);
-            }
-          });
-        }
+      if (needsRebuild(oldParams, newParams)) {
+        rebuildWithCrossfade();
+      } else {
+        updateFilterParamsSmoothly(newParams);
       }
     },
+    [needsRebuild, rebuildWithCrossfade, updateFilterParamsSmoothly]
+  );
+
+  const getAnalyser = useCallback(
+    () => activeGraphRef.current?.analyser ?? null,
     []
   );
 
-  const getAnalyser = useCallback(() => analyserRef.current, []);
-
   useEffect(() => {
     return () => {
-      stop();
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
+      const ctx = audioContextRef.current;
+      const graph = activeGraphRef.current;
+
+      if (graph && ctx) {
+        const now = ctx.currentTime;
+        graph.gain.gain.cancelScheduledValues(now);
+        try {
+          graph.gain.gain.setValueAtTime(graph.gain.gain.value, now);
+          graph.gain.gain.linearRampToValueAtTime(0, now + CROSSFADE_DURATION);
+        } catch {
+          // ignore
+        }
+        try {
+          graph.source.stop(now + CROSSFADE_DURATION + 0.02);
+        } catch {
+          // ignore
+        }
       }
+
+      setTimeout(() => {
+        if (ctx) ctx.close().catch(() => undefined);
+      }, (CROSSFADE_DURATION + 0.05) * 1000);
     };
-  }, [stop]);
+  }, []);
 
   return { start, stop, updateParams, getAnalyser };
 };
