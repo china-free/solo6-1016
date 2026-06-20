@@ -1,7 +1,8 @@
 import { useRef, useCallback, useEffect } from 'react';
-import type { NoiseType } from '../types';
+import { useAppStore } from '../store/useAppStore';
+import type { NoiseType, MaskingParameters, AudioState } from '../types';
 
-interface UseAudioEngineOptions {
+interface EngineParams {
   centerFrequency: number;
   bandwidth: number;
   soundLevel: number;
@@ -10,31 +11,42 @@ interface UseAudioEngineOptions {
   volume: number;
 }
 
-interface UseAudioEngineReturn {
-  start: () => void;
-  stop: () => void;
-  updateParams: (params: Partial<UseAudioEngineOptions>) => void;
-  getAnalyser: () => AnalyserNode | null;
+interface AudioGraph {
+  source: AudioBufferSourceNode;
+  filters: BiquadFilterNode[];
+  gain: GainNode;
+  analyser: AnalyserNode;
 }
 
 const FREQUENCY_REBUILD_THRESHOLD = 200;
 const BANDWIDTH_REBUILD_THRESHOLD = 300;
 const CROSSFADE_DURATION = 0.05;
 
-export const useAudioEngine = (
-  initialParams: UseAudioEngineOptions
-): UseAudioEngineReturn => {
+const resolveEngineParams = (
+  maskingParams: MaskingParameters | null,
+  audioState: AudioState
+): EngineParams | null => {
+  if (!maskingParams) return null;
+  return {
+    centerFrequency: maskingParams.centerFrequency + audioState.frequencyOffset,
+    bandwidth: Math.max(50, maskingParams.bandwidth + audioState.bandwidthOffset),
+    soundLevel: maskingParams.soundLevel + audioState.levelOffset,
+    noiseType: audioState.noiseType ?? maskingParams.noiseType,
+    notchFrequency: maskingParams.notchFrequency,
+    volume: audioState.volume,
+  };
+};
+
+interface UseAudioEngineReturn {
+  getAnalyser: () => AnalyserNode | null;
+}
+
+export const useAudioEngine = (): UseAudioEngineReturn => {
   const audioContextRef = useRef<AudioContext | null>(null);
+  const activeGraphRef = useRef<AudioGraph | null>(null);
 
-  const activeGraphRef = useRef<{
-    source: AudioBufferSourceNode;
-    filters: BiquadFilterNode[];
-    gain: GainNode;
-    analyser: AnalyserNode;
-  } | null>(null);
-
-  const paramsRef = useRef(initialParams);
-  const isPlayingRef = useRef(false);
+  const lastParamsRef = useRef<EngineParams | null>(null);
+  const lastIsPlayingRef = useRef(false);
 
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
@@ -86,9 +98,8 @@ export const useAudioEngine = (
   );
 
   const buildGraph = useCallback(
-    (ctx: AudioContext, params: UseAudioEngineOptions) => {
-      const noiseType: NoiseType = params.noiseType;
-      const buffer = createNoiseBuffer(ctx, noiseType);
+    (ctx: AudioContext, params: EngineParams): AudioGraph => {
+      const buffer = createNoiseBuffer(ctx, params.noiseType);
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
@@ -100,7 +111,7 @@ export const useAudioEngine = (
       const centerFreq = params.centerFrequency;
       const bw = params.bandwidth;
 
-      if (noiseType === 'narrowband' || noiseType === 'notched') {
+      if (params.noiseType === 'narrowband' || params.noiseType === 'notched') {
         const bpFilter = ctx.createBiquadFilter();
         bpFilter.type = 'bandpass';
         bpFilter.frequency.value = centerFreq;
@@ -108,7 +119,7 @@ export const useAudioEngine = (
         filters.push(bpFilter);
         currentNode.connect(bpFilter);
         currentNode = bpFilter;
-      } else if (noiseType === 'pink' || noiseType === 'white' || noiseType === 'brown') {
+      } else if (params.noiseType === 'pink' || params.noiseType === 'white' || params.noiseType === 'brown') {
         const hpFilter = ctx.createBiquadFilter();
         hpFilter.type = 'highpass';
         hpFilter.frequency.value = Math.max(50, centerFreq - bw * 2);
@@ -126,7 +137,7 @@ export const useAudioEngine = (
         currentNode = lpFilter;
       }
 
-      if (noiseType === 'notched' && params.notchFrequency) {
+      if (params.noiseType === 'notched' && params.notchFrequency) {
         const notchFilter = ctx.createBiquadFilter();
         notchFilter.type = 'notch';
         notchFilter.frequency.value = params.notchFrequency;
@@ -154,45 +165,42 @@ export const useAudioEngine = (
   );
 
   const needsRebuild = useCallback(
-    (
-      oldParams: UseAudioEngineOptions,
-      newParams: Partial<UseAudioEngineOptions>
-    ): boolean => {
-      if (newParams.noiseType !== undefined && newParams.noiseType !== oldParams.noiseType) {
-        return true;
-      }
-      if (
-        newParams.notchFrequency !== undefined &&
-        newParams.notchFrequency !== oldParams.notchFrequency
-      ) {
-        return true;
-      }
-      if (
-        newParams.centerFrequency !== undefined &&
-        Math.abs(newParams.centerFrequency - oldParams.centerFrequency) >
-          FREQUENCY_REBUILD_THRESHOLD
-      ) {
-        return true;
-      }
-      if (
-        newParams.bandwidth !== undefined &&
-        Math.abs(newParams.bandwidth - oldParams.bandwidth) >
-          BANDWIDTH_REBUILD_THRESHOLD
-      ) {
-        return true;
-      }
+    (oldParams: EngineParams, newParams: EngineParams): boolean => {
+      if (newParams.noiseType !== oldParams.noiseType) return true;
+      if (newParams.notchFrequency !== oldParams.notchFrequency) return true;
+      if (Math.abs(newParams.centerFrequency - oldParams.centerFrequency) > FREQUENCY_REBUILD_THRESHOLD) return true;
+      if (Math.abs(newParams.bandwidth - oldParams.bandwidth) > BANDWIDTH_REBUILD_THRESHOLD) return true;
       return false;
     },
     []
   );
 
-  const rebuildWithCrossfade = useCallback(() => {
-    const ctx = audioContextRef.current;
-    if (!ctx) return;
+  const disposeGraph = useCallback((graph: AudioGraph, ctx: AudioContext) => {
+    const now = ctx.currentTime;
+    try {
+      graph.gain.gain.cancelScheduledValues(now);
+      graph.gain.gain.setValueAtTime(graph.gain.gain.value, now);
+      graph.gain.gain.linearRampToValueAtTime(0, now + CROSSFADE_DURATION);
+    } catch {
+      // ignore
+    }
+    const source = graph.source;
+    const gainNode = graph.gain;
+    const analyser = graph.analyser;
+    const filters = graph.filters;
+    setTimeout(() => {
+      try { source.stop(); } catch { /* ignore */ }
+      source.disconnect();
+      filters.forEach((f) => f.disconnect());
+      gainNode.disconnect();
+      analyser.disconnect();
+    }, (CROSSFADE_DURATION + 0.02) * 1000);
+  }, []);
 
+  const rebuildWithCrossfade = useCallback((ctx: AudioContext, params: EngineParams) => {
     const now = ctx.currentTime;
     const oldGraph = activeGraphRef.current;
-    const newGraph = buildGraph(ctx, paramsRef.current);
+    const newGraph = buildGraph(ctx, params);
 
     if (oldGraph) {
       oldGraph.gain.gain.cancelScheduledValues(now);
@@ -210,169 +218,140 @@ export const useAudioEngine = (
     activeGraphRef.current = newGraph;
 
     if (oldGraph) {
-      const oldSource = oldGraph.source;
-      const oldGain = oldGraph.gain;
-      const oldAnalyser = oldGraph.analyser;
-      const oldFilters = oldGraph.filters;
-
+      const src = oldGraph.source;
+      const gn = oldGraph.gain;
+      const an = oldGraph.analyser;
+      const fs = oldGraph.filters;
       setTimeout(() => {
-        try {
-          oldSource.stop();
-        } catch {
-          // ignore
-        }
-        oldSource.disconnect();
-        oldFilters.forEach((f) => f.disconnect());
-        oldGain.disconnect();
-        oldAnalyser.disconnect();
+        try { src.stop(); } catch { /* ignore */ }
+        src.disconnect();
+        fs.forEach((f) => f.disconnect());
+        gn.disconnect();
+        an.disconnect();
       }, (CROSSFADE_DURATION + 0.02) * 1000);
     }
   }, [buildGraph]);
 
-  const updateFilterParamsSmoothly = useCallback(
-    (newParams: Partial<UseAudioEngineOptions>) => {
-      const ctx = audioContextRef.current;
-      const graph = activeGraphRef.current;
-      if (!ctx || !graph) return;
+  const updateFilterParamsSmoothly = useCallback((ctx: AudioContext, params: EngineParams) => {
+    const graph = activeGraphRef.current;
+    if (!graph) return;
 
-      const time = ctx.currentTime;
+    const time = ctx.currentTime;
 
-      if (newParams.soundLevel !== undefined || newParams.volume !== undefined) {
-        const params = paramsRef.current;
-        const levelMultiplier =
-          Math.pow(10, params.soundLevel / 20) * params.volume * 0.3;
-        graph.gain.gain.setTargetAtTime(levelMultiplier, time, CROSSFADE_DURATION);
+    const levelMultiplier =
+      Math.pow(10, params.soundLevel / 20) * params.volume * 0.3;
+    graph.gain.gain.setTargetAtTime(levelMultiplier, time, CROSSFADE_DURATION);
+
+    graph.filters.forEach((filter) => {
+      if (filter.type === 'bandpass' && params.bandwidth > 0) {
+        filter.frequency.setTargetAtTime(
+          params.centerFrequency,
+          time,
+          CROSSFADE_DURATION
+        );
+        filter.Q.setTargetAtTime(
+          params.centerFrequency / (params.bandwidth * 2),
+          time,
+          CROSSFADE_DURATION
+        );
       }
-
-      if (
-        newParams.centerFrequency !== undefined ||
-        newParams.bandwidth !== undefined
-      ) {
-        const params = paramsRef.current;
-        graph.filters.forEach((filter) => {
-          if (filter.type === 'bandpass' && params.bandwidth > 0) {
-            filter.frequency.setTargetAtTime(
-              params.centerFrequency,
-              time,
-              CROSSFADE_DURATION
-            );
-            filter.Q.setTargetAtTime(
-              params.centerFrequency / (params.bandwidth * 2),
-              time,
-              CROSSFADE_DURATION
-            );
-          }
-          if (filter.type === 'highpass') {
-            filter.frequency.setTargetAtTime(
-              Math.max(50, params.centerFrequency - params.bandwidth * 2),
-              time,
-              CROSSFADE_DURATION
-            );
-          }
-          if (filter.type === 'lowpass') {
-            filter.frequency.setTargetAtTime(
-              Math.min(20000, params.centerFrequency + params.bandwidth * 2),
-              time,
-              CROSSFADE_DURATION
-            );
-          }
-        });
+      if (filter.type === 'highpass') {
+        filter.frequency.setTargetAtTime(
+          Math.max(50, params.centerFrequency - params.bandwidth * 2),
+          time,
+          CROSSFADE_DURATION
+        );
       }
-
-      if (newParams.notchFrequency !== undefined) {
-        const params = paramsRef.current;
-        graph.filters.forEach((filter) => {
-          if (filter.type === 'notch' && params.notchFrequency) {
-            filter.frequency.setTargetAtTime(
-              params.notchFrequency,
-              time,
-              CROSSFADE_DURATION
-            );
-          }
-        });
+      if (filter.type === 'lowpass') {
+        filter.frequency.setTargetAtTime(
+          Math.min(20000, params.centerFrequency + params.bandwidth * 2),
+          time,
+          CROSSFADE_DURATION
+        );
       }
-    },
-    []
-  );
+      if (filter.type === 'notch' && params.notchFrequency) {
+        filter.frequency.setTargetAtTime(
+          params.notchFrequency,
+          time,
+          CROSSFADE_DURATION
+        );
+      }
+    });
+  }, []);
 
-  const start = useCallback(() => {
-    const ctx = initAudioContext();
-    if (ctx.state === 'suspended') {
-      ctx.resume();
-    }
+  const applyState = useCallback(() => {
+    const state = useAppStore.getState();
+    const newParams = resolveEngineParams(state.maskingParams, state.audioState);
+    const newIsPlaying = state.audioState.isPlaying;
 
-    if (isPlayingRef.current && activeGraphRef.current) {
+    const lastParams = lastParamsRef.current;
+    const lastIsPlaying = lastIsPlayingRef.current;
+
+    // Case 1: 没有 maskingParams，停止播放并清理
+    if (!newParams) {
+      if (lastIsPlaying && activeGraphRef.current && audioContextRef.current) {
+        disposeGraph(activeGraphRef.current, audioContextRef.current);
+      }
+      activeGraphRef.current = null;
+      lastParamsRef.current = null;
+      lastIsPlayingRef.current = false;
       return;
     }
 
-    const graph = buildGraph(ctx, paramsRef.current);
-    graph.source.start();
-    activeGraphRef.current = graph;
-    isPlayingRef.current = true;
-  }, [initAudioContext, buildGraph]);
-
-  const stop = useCallback(() => {
-    const ctx = audioContextRef.current;
-    const graph = activeGraphRef.current;
-
-    if (graph && ctx) {
-      const now = ctx.currentTime;
-      graph.gain.gain.cancelScheduledValues(now);
-      graph.gain.gain.setValueAtTime(graph.gain.gain.value, now);
-      graph.gain.gain.linearRampToValueAtTime(0, now + CROSSFADE_DURATION);
-
-      const source = graph.source;
-      const gain = graph.gain;
-      const analyser = graph.analyser;
-      const filters = graph.filters;
-
-      setTimeout(() => {
-        try {
-          source.stop();
-        } catch {
-          // ignore
-        }
-        source.disconnect();
-        filters.forEach((f) => f.disconnect());
-        gain.disconnect();
-        analyser.disconnect();
-      }, (CROSSFADE_DURATION + 0.02) * 1000);
+    // Case 2: 从停止变为播放
+    if (!lastIsPlaying && newIsPlaying) {
+      const ctx = initAudioContext();
+      if (ctx.state === 'suspended') ctx.resume();
+      const graph = buildGraph(ctx, newParams);
+      graph.source.start();
+      activeGraphRef.current = graph;
+      lastParamsRef.current = newParams;
+      lastIsPlayingRef.current = true;
+      return;
     }
 
-    activeGraphRef.current = null;
-    isPlayingRef.current = false;
-  }, []);
-
-  const updateParams = useCallback(
-    (newParams: Partial<UseAudioEngineOptions>) => {
-      const oldParams = { ...paramsRef.current };
-      paramsRef.current = { ...oldParams, ...newParams };
-
-      if (!isPlayingRef.current) return;
-
-      if (needsRebuild(oldParams, newParams)) {
-        rebuildWithCrossfade();
-      } else {
-        updateFilterParamsSmoothly(newParams);
+    // Case 3: 从播放变为停止
+    if (lastIsPlaying && !newIsPlaying) {
+      if (activeGraphRef.current && audioContextRef.current) {
+        disposeGraph(activeGraphRef.current, audioContextRef.current);
       }
-    },
-    [needsRebuild, rebuildWithCrossfade, updateFilterParamsSmoothly]
-  );
+      activeGraphRef.current = null;
+      lastParamsRef.current = newParams;
+      lastIsPlayingRef.current = false;
+      return;
+    }
 
-  const getAnalyser = useCallback(
-    () => activeGraphRef.current?.analyser ?? null,
-    []
-  );
+    // Case 4: 正在播放，参数更新
+    if (lastIsPlaying && newIsPlaying && lastParams) {
+      if (needsRebuild(lastParams, newParams)) {
+        const ctx = initAudioContext();
+        rebuildWithCrossfade(ctx, newParams);
+      } else {
+        const ctx = audioContextRef.current;
+        if (ctx) updateFilterParamsSmoothly(ctx, newParams);
+      }
+      lastParamsRef.current = newParams;
+      return;
+    }
+
+    // Case 5: 未播放，参数更新（只记录，不建图）
+    if (!lastIsPlaying && !newIsPlaying) {
+      lastParamsRef.current = newParams;
+      return;
+    }
+  }, [initAudioContext, buildGraph, needsRebuild, rebuildWithCrossfade, updateFilterParamsSmoothly, disposeGraph]);
 
   useEffect(() => {
+    applyState();
+    const unsubscribe = useAppStore.subscribe(applyState);
     return () => {
+      unsubscribe();
       const ctx = audioContextRef.current;
       const graph = activeGraphRef.current;
-
       if (graph && ctx) {
         const now = ctx.currentTime;
-        graph.gain.gain.cancelScheduledValues(now);
         try {
+          graph.gain.gain.cancelScheduledValues(now);
           graph.gain.gain.setValueAtTime(graph.gain.gain.value, now);
           graph.gain.gain.linearRampToValueAtTime(0, now + CROSSFADE_DURATION);
         } catch {
@@ -384,12 +363,16 @@ export const useAudioEngine = (
           // ignore
         }
       }
-
       setTimeout(() => {
         if (ctx) ctx.close().catch(() => undefined);
       }, (CROSSFADE_DURATION + 0.05) * 1000);
     };
-  }, []);
+  }, [applyState]);
 
-  return { start, stop, updateParams, getAnalyser };
+  const getAnalyser = useCallback(
+    () => activeGraphRef.current?.analyser ?? null,
+    []
+  );
+
+  return { getAnalyser };
 };

@@ -37,6 +37,7 @@ export interface AudioState {
   frequencyOffset: number;
   bandwidthOffset: number;
   levelOffset: number;
+  noiseType: NoiseType | null;
 }
 
 export const STANDARD_FREQUENCIES = [125, 250, 500, 1000, 2000, 4000, 8000];

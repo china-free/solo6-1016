@@ -1,4 +1,3 @@
-import { useEffect, useRef } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { useAudioEngine } from '../hooks/useAudioEngine';
 import { WaveformVisualizer } from './WaveformVisualizer';
@@ -17,57 +16,23 @@ export const AudioPlayer = () => {
   const maskingParams = useAppStore((s) => s.maskingParams);
   const audioState = useAppStore((s) => s.audioState);
   const setAudioState = useAppStore((s) => s.setAudioState);
-  const engineParamsRef = useRef({
-    centerFrequency: maskingParams?.centerFrequency ?? 4000,
-    bandwidth: maskingParams?.bandwidth ?? 500,
-    soundLevel: maskingParams?.soundLevel ?? 20,
-    noiseType: (maskingParams?.noiseType as NoiseType) ?? 'narrowband',
-    notchFrequency: maskingParams?.notchFrequency,
-    volume: audioState.volume,
-  });
 
-  const { start, stop, updateParams, getAnalyser } = useAudioEngine(engineParamsRef.current);
+  const { getAnalyser } = useAudioEngine();
 
-  useEffect(() => {
-    if (maskingParams) {
-      engineParamsRef.current = {
-        centerFrequency: maskingParams.centerFrequency + audioState.frequencyOffset,
-        bandwidth: Math.max(50, maskingParams.bandwidth + audioState.bandwidthOffset),
-        soundLevel: maskingParams.soundLevel + audioState.levelOffset,
-        noiseType: maskingParams.noiseType as NoiseType,
-        notchFrequency: maskingParams.notchFrequency,
-        volume: audioState.volume,
-      };
-      updateParams(engineParamsRef.current);
-    }
-  }, [maskingParams, audioState.frequencyOffset, audioState.bandwidthOffset, audioState.levelOffset, audioState.volume, updateParams]);
-
-  useEffect(() => {
-    return () => {
-      stop();
-    };
-  }, [stop]);
+  const currentNoiseType: NoiseType | null = audioState.noiseType
+    ?? maskingParams?.noiseType
+    ?? null;
 
   const handleTogglePlay = () => {
-    if (audioState.isPlaying) {
-      stop();
-      setAudioState({ isPlaying: false });
-    } else {
-      start();
-      setAudioState({ isPlaying: true });
-    }
+    setAudioState({ isPlaying: !audioState.isPlaying });
   };
 
   const handleNoiseTypeChange = (type: NoiseType) => {
     if (!maskingParams) return;
-    engineParamsRef.current = {
-      ...engineParamsRef.current,
-      noiseType: type,
-    };
-    updateParams({ noiseType: type });
+    setAudioState({
+      noiseType: type === maskingParams.noiseType ? null : type,
+    });
   };
-
-  const currentNoiseType = engineParamsRef.current.noiseType;
 
   return (
     <div className="p-5 bg-slate-900/60 backdrop-blur-sm rounded-2xl border border-slate-700/50">

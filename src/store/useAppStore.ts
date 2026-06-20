@@ -48,6 +48,7 @@ export const useAppStore = create<AppState>((set) => ({
     frequencyOffset: 0,
     bandwidthOffset: 0,
     levelOffset: 0,
+    noiseType: null,
   },
   setLeftEar: (data) => set({ leftEar: data }),
   setRightEar: (data) => set({ rightEar: data }),
@@ -87,6 +88,7 @@ export const useAppStore = create<AppState>((set) => ({
         frequencyOffset: 0,
         bandwidthOffset: 0,
         levelOffset: 0,
+        noiseType: null,
       },
     }),
 }));
